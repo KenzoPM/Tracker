@@ -1,0 +1,163 @@
+# watch_multi_trackr_discord.py
+import os, time, json, hashlib, requests
+from datetime import datetime
+from pathlib import Path
+
+DISCORD_WEBHOOK = os.getenv("https://discord.com/api/webhooks/1430168333172605001/unfXITL1Tqhb5hd-l4Gzb18tOJNdKMuFmZ0ckm1SbIHOkNIxGZH0Rl6JIgm3LOJycRfD")
+TRACKR_URLS = os.getenv("https://api.the-trackr.com/programmes?region=UK&industry=Finance&season=2026&type=off-cycle-internships", "https://api.the-trackr.com/programmes?region=UK&industry=Finance&season=2026&type=summer-internships","https://api.the-trackr.com/programmes?region=EU&industry=Finance&season=2026&type=summer-internships", "https://api.the-trackr.com/programmes?region=EU&industry=Finance&season=2026&type=off-cycle-internships" ).strip()  # multi-lignes: "NOM|URL" ou "URL"
+CHECK_EVERY_SECONDS = int(os.getenv("CHECK_EVERY_SECONDS", "0"))  # en Actions: 0 (une seule passe)
+STATE_DIR = Path(os.getenv("STATE_DIR", "state"))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = STATE_DIR / "seen_offers_multi.json"
+
+if not DISCORD_WEBHOOK:
+    raise SystemExit("⚠️ DISCORD_WEBHOOK requis (Secret GitHub).")
+if not TRACKR_URLS:
+    raise SystemExit("⚠️ TRACKR_URLS requis (Variables/Secrets GitHub).")
+
+def parse_sources(raw: str):
+    """Chaque ligne: 'NOM|URL' ou juste 'URL'. Retourne liste de (name, url, key)."""
+    out = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "|" in line:
+            name, url = [x.strip() for x in line.split("|", 1)]
+        else:
+            name, url = None, line
+        key_base = (name or url).lower()
+        key = hashlib.sha256(key_base.encode("utf-8")).hexdigest()[:12]
+        label = name or url.split("?",1)[0].rsplit("/",1)[-1]  # petit label lisible
+        out.append((label, url, key))
+    return out
+
+def safe_get(d, *keys, default=""):
+    for k in keys:
+        v = d.get(k)
+        if v:
+            return str(v).strip()
+    return default
+
+def make_id(item):
+    native_id = safe_get(item, "id", "_id")
+    if native_id:
+        return native_id
+    base = "|".join([
+        safe_get(item, "company", "employer"),
+        safe_get(item, "title", "role", "name"),
+        safe_get(item, "location", "city"),
+        safe_get(item, "url", "apply_url", "link"),
+        safe_get(item, "posted_at", "created_at")
+    ])
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+
+def parse_offers(data):
+    # localise la liste d'items
+    if isinstance(data, dict):
+        for key in ("results", "data", "items", "offers", "jobs", "programmes"):
+            if key in data and isinstance(data[key], list):
+                data = data[key]
+                break
+    if not isinstance(data, list):
+        data = []
+    offers = []
+    for it in data:
+        offers.append({
+            "id": make_id(it),
+            "company": safe_get(it, "company", "employer"),
+            "title": safe_get(it, "title", "role", "name", default="Summer Internship"),
+            "location": safe_get(it, "location", "city"),
+            "url": safe_get(it, "url", "apply_url", "link"),
+            "posted_at": safe_get(it, "posted_at", "created_at"),
+            "deadline": safe_get(it, "deadline", "close_date"),
+        })
+    return offers
+
+def send_discord(text: str):
+    try:
+        requests.post(DISCORD_WEBHOOK, json={"content": text}, timeout=15)
+    except requests.RequestException as e:
+        print(f"[Discord] Erreur d’envoi: {e}")
+
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.load(STATE_FILE.open("r", encoding="utf-8"))
+        except Exception:
+            pass
+    return {"sources": {}}
+
+def save_state(state):
+    json.dump(state, STATE_FILE.open("w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+def check_source(label: str, url: str, key: str, state: dict):
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[{label}] Erreur fetch: {e}")
+        return False
+
+    offers = parse_offers(data)
+    src = state["sources"].setdefault(key, {"seen_ids": []})
+    seen_ids = src.get("seen_ids", [])
+    new_offers = [o for o in offers if o["id"] not in seen_ids]
+
+    if new_offers:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n=== [{label}] 🎉 Nouvelles offres ({len(new_offers)}) — {now} ===")
+        lines = []
+        for o in new_offers:
+            line = f"- {o['company']} — {o['title']} ({o['location']})"
+            if o["url"]:
+                line += f" → {o['url']}"
+            print(line)
+            lines.append(line)
+        print("=============================================\n")
+
+        # Envoi Discord (préfixé par la source)
+        send_discord(f"🛰️ **{label}** — 🎉 Nouvelles offres détectées ({len(new_offers)})")
+        chunk = ""
+        for line in lines:
+            if len(chunk) + len(line) + 1 > 1800:
+                send_discord(chunk); chunk = line
+            else:
+                chunk = (chunk + "\n" + line) if chunk else line
+        if chunk:
+            send_discord(chunk)
+
+        # Màj mémoire
+        for o in new_offers:
+            seen_ids.append(o["id"])
+        src["seen_ids"] = seen_ids
+        state["sources"][key] = src
+        return True
+    else:
+        print(f"[{label}] Pas de nouvelles offres.")
+        return False
+
+def main_once():
+    sources = parse_sources(TRACKR_URLS)
+    state = load_state()
+    any_change = False
+    for label, url, key in sources:
+        changed = check_source(label, url, key, state)
+        any_change = any_change or changed
+        # petite pause pour ne pas spammer
+        time.sleep(1.0)
+    if any_change:
+        save_state(state)
+    else:
+        # on sauvegarde quand même si le fichier n'existe pas encore
+        if not STATE_FILE.exists():
+            save_state(state)
+
+if __name__ == "__main__":
+    main_once()
+    if CHECK_EVERY_SECONDS > 0:
+        while True:
+            time.sleep(CHECK_EVERY_SECONDS)
+            main_once()
