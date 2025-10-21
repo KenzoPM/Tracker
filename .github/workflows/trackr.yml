@@ -5,6 +5,7 @@ on:
     - cron: "*/5 * * * *"   # toutes les 5 minutes
   workflow_dispatch:
 
+# IMPORTANT: autoriser le workflow à pousser des commits
 permissions:
   contents: write
 
@@ -20,25 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Prepare state branch
-        run: |
-          set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Branche par défaut du dépôt (souvent 'main' ou 'master')
-          DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
-          if git ls-remote --exit-code --heads origin trackr-state; then
-            git fetch origin trackr-state:trackr-state
-            git checkout trackr-state
-            # on merge le dernier code du dépôt dans la branche d'état
-            git fetch origin "${DEFAULT_BRANCH}:${DEFAULT_BRANCH}"
-            git merge --strategy-option theirs "origin/${DEFAULT_BRANCH}" || true
-          else
-            # créer la branche d'état depuis la branche par défaut
-            git fetch origin "${DEFAULT_BRANCH}:${DEFAULT_BRANCH}"
-            git checkout -b trackr-state "origin/${DEFAULT_BRANCH}"
-          fi
+          persist-credentials: true   # indispensable pour pousser un commit
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -59,11 +42,19 @@ jobs:
         run: |
           python watch_multi_trackr_discord.py
 
-      - name: Commit & push state if changed
+      - name: Commit & push state (if changed)
         run: |
-          git add state/seen_offers_multi.json || true
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # ajouter le fichier d'état s'il existe
+          if [ -f state/seen_offers_multi.json ]; then
+            git add state/seen_offers_multi.json
+          fi
+          # committer seulement s'il y a des changements
           if ! git diff --cached --quiet; then
             git commit -m "chore(state): update seen_offers_multi.json [skip ci]"
-            git push origin trackr-state
+            git push
           else
             echo "No state change."
+          fi
