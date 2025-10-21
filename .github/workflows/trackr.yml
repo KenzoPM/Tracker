@@ -1,0 +1,61 @@
+name: Trackr Monitor (multi)
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # toutes les 5 minutes
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trackr-monitor
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Prepare state branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin trackr-state; then
+            git fetch origin trackr-state:trackr-state
+            git checkout trackr-state
+            git merge --strategy-option theirs origin/${{ github.ref_name || 'main' }} || true
+          else
+            git checkout -b trackr-state
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          echo "requests" > requirements.txt
+          pip install -r requirements.txt
+
+      - name: Run monitor (multi)
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TRACKR_URLS: ${{ vars.TRACKR_URLS }}
+          CHECK_EVERY_SECONDS: "0"
+          STATE_DIR: "state"
+        run: |
+          python watch_multi_trackr_discord.py
+
+      - name: Commit & push state if changed
+        run: |
+          git add state/seen_offers_multi.json || true
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(state): update seen_offers_multi.json [skip ci]"
+            git push origin trackr-state
+          else:
+            echo "No state change."
